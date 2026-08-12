@@ -35,3 +35,16 @@ def test_minimal_forward_and_known_pixels() -> None:
     assert output.gate.shape == (1, 2)
     assert torch.equal(output.completed * (1 - mask), image * (1 - mask))
 
+
+def test_all_backbones_preserve_the_generator_contract() -> None:
+    image = torch.randn(1, 3, 256, 256).clamp(-1, 1)
+    mask = torch.zeros(1, 1, 256, 256)
+    mask[:, :, 64:192, 64:192] = 1
+    reference = torch.randn_like(image).clamp(-1, 1)
+    for backbone in ("swin", "unet", "mamba"):
+        model = DunhuangTACO(
+            backbone=backbone, patch_batch_size=1, dim=16, depth=1, heads=4
+        )
+        output = model(image, mask, reference)
+        assert output.completed.shape == image.shape
+        assert torch.equal(output.completed * (1 - mask), image * (1 - mask))

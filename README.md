@@ -21,3 +21,9 @@ parallel branches:
 The two enhanced representations are fused and decoded by the shared Swin
 Transformer decoder to produce the restored mural.
 
+For the backbone ablation, `--backbone {swin,unet,mamba}` replaces only the
+shared patch encoder and decoder while keeping R-TAP, SCA, and fusion fixed.
+Parameter counts and computation at 1024×1024 resolution can be reproduced with
+`python complexity.py --resolution 1024`. The script reports multiply-accumulate
+operations (MACs); double the values if FLOPs are defined as separate multiply
+and addition operations.

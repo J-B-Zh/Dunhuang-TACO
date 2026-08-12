@@ -2,7 +2,9 @@
 
 The implementation mirrors Sections 3.2--3.5 of the manuscript: a shared
 chunk-wise Swin patch backbone, parallel SCA/R-TAP sparse graphs, and
-mask-guided convex fusion.
+mask-guided convex fusion. The patch encoder/decoder can be replaced with
+Swin Transformer, U-Net-style CNN, or Mamba-style state-space blocks for the
+backbone ablation while keeping SCA, R-TAP, and feature fusion unchanged.
 """
 
 from __future__ import annotations
@@ -92,6 +94,167 @@ class SwinPatchDecoder(nn.Module):
         return torch.tanh(self.output(x))
 
 
+class DoubleConv(nn.Module):
+    """Two convolutional layers used at each U-Net resolution."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(1, out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(1, out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.block(x)
+
+
+class UNetPatchEncoder(nn.Module):
+    """Two-level U-Net encoder returning its skip features explicitly."""
+
+    def __init__(self, dim: int = 96, depth: int = 4, heads: int = 4):
+        super().__init__()
+        del depth, heads
+        base = max(16, dim // 2)
+        self.stage1 = DoubleConv(3, base)
+        self.stage2 = DoubleConv(base, dim)
+        self.bottleneck = DoubleConv(dim, dim)
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, patches: Tensor) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        skip1 = self.stage1(patches)
+        skip2 = self.stage2(self.pool(skip1))
+        encoded = self.bottleneck(self.pool(skip2))
+        return encoded, (skip1, skip2)
+
+
+class UNetPatchDecoder(nn.Module):
+    """U-Net decoder with skip connections from :class:`UNetPatchEncoder`."""
+
+    def __init__(self, dim: int = 96, depth: int = 4, heads: int = 4):
+        super().__init__()
+        del depth, heads
+        base = max(16, dim // 2)
+        self.up1 = nn.ConvTranspose2d(dim, dim, kernel_size=2, stride=2)
+        self.stage1 = DoubleConv(dim * 2, dim)
+        self.up2 = nn.ConvTranspose2d(dim, base, kernel_size=2, stride=2)
+        self.stage2 = DoubleConv(base * 2, base)
+        self.output = nn.Conv2d(base, 3, 1)
+
+    def forward(self, features: Tensor, skips: tuple[Tensor, Tensor]) -> Tensor:
+        skip1, skip2 = skips
+        x = self.stage1(torch.cat((self.up1(features), skip2), dim=1))
+        x = self.stage2(torch.cat((self.up2(x), skip1), dim=1))
+        return torch.tanh(self.output(x))
+
+
+class MambaBlock(nn.Module):
+    """Pure-PyTorch selective state-space block for backbone ablations.
+
+    The recurrent scan is linear in sequence length. Four directional scans
+    (left-to-right, right-to-left, top-to-bottom, and bottom-to-top) provide
+    bidirectional 2-D context without requiring a platform-specific CUDA
+    extension.
+    """
+
+    def __init__(
+        self, dim: int, expansion: int = 2, conv_kernel: int = 3, state_dim: int = 16
+    ):
+        super().__init__()
+        inner = dim * expansion
+        dt_rank = max(1, math.ceil(dim / 16))
+        self.norm = nn.LayerNorm(dim)
+        self.in_proj = nn.Linear(dim, inner * 2)
+        self.depthwise = nn.Conv1d(
+            inner, inner, conv_kernel, padding=conv_kernel - 1, groups=inner
+        )
+        self.x_proj = nn.Linear(inner, dt_rank + state_dim * 2, bias=False)
+        self.dt_proj = nn.Linear(dt_rank, inner)
+        self.A_log = nn.Parameter(
+            torch.log(torch.arange(1, state_dim + 1, dtype=torch.float32))
+            .unsqueeze(0)
+            .repeat(inner, 1)
+        )
+        self.D = nn.Parameter(torch.ones(inner))
+        self.dt_rank = dt_rank
+        self.state_dim = state_dim
+        self.out_proj = nn.Linear(inner, dim)
+
+    def _scan(self, x: Tensor) -> Tensor:
+        projected, gate = self.in_proj(self.norm(x)).chunk(2, dim=-1)
+        projected = self.depthwise(projected.transpose(1, 2))[..., : x.shape[1]].transpose(1, 2)
+        projected = F.silu(projected)
+        parameters = self.x_proj(projected)
+        dt, b_vector, c_vector = torch.split(
+            parameters, (self.dt_rank, self.state_dim, self.state_dim), dim=-1
+        )
+        dt = F.softplus(self.dt_proj(dt))
+        transition = -torch.exp(self.A_log).to(projected.dtype)
+        state = projected.new_zeros(
+            projected.shape[0], projected.shape[2], self.state_dim
+        )
+        values = []
+        for x_step, dt_step, b_step, c_step in zip(
+            projected.unbind(dim=1),
+            dt.unbind(dim=1),
+            b_vector.unbind(dim=1),
+            c_vector.unbind(dim=1),
+        ):
+            discrete_a = torch.exp(dt_step.unsqueeze(-1) * transition)
+            discrete_b = dt_step.unsqueeze(-1) * b_step.unsqueeze(1)
+            state = discrete_a * state + discrete_b * x_step.unsqueeze(-1)
+            y_step = (state * c_step.unsqueeze(1)).sum(dim=-1) + self.D * x_step
+            values.append(y_step)
+        return torch.stack(values, dim=1) * F.silu(gate)
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, c, h, w = x.shape
+        rows = x.permute(0, 2, 3, 1).reshape(b * h, w, c)
+        cols = x.permute(0, 3, 2, 1).reshape(b * w, h, c)
+        rows_bi = self._scan(rows) + self._scan(rows.flip(1)).flip(1)
+        cols_bi = self._scan(cols) + self._scan(cols.flip(1)).flip(1)
+        rows_bi = rows_bi.reshape(b, h, w, c)
+        cols_bi = cols_bi.reshape(b, w, h, c).permute(0, 2, 1, 3)
+        mixed = 0.25 * (rows_bi + cols_bi)
+        return x + self.out_proj(mixed).permute(0, 3, 1, 2).contiguous()
+
+
+class MambaPatchEncoder(nn.Module):
+    """Mamba-style state-space replacement for the Swin patch encoder."""
+
+    def __init__(self, dim: int = 96, depth: int = 4, heads: int = 4):
+        super().__init__()
+        del heads
+        self.embed = nn.Conv2d(3, dim, kernel_size=4, stride=4)
+        self.blocks = nn.Sequential(*(MambaBlock(dim) for _ in range(depth)))
+
+    def forward(self, patches: Tensor) -> Tensor:
+        return self.blocks(self.embed(patches))
+
+
+class MambaPatchDecoder(nn.Module):
+    """Mamba-style decoder paired with :class:`MambaPatchEncoder`."""
+
+    def __init__(self, dim: int = 96, depth: int = 4, heads: int = 4):
+        super().__init__()
+        del heads
+        self.blocks = nn.Sequential(*(MambaBlock(dim) for _ in range(depth)))
+        self.output = nn.Sequential(nn.Conv2d(dim, 3 * 16, 3, padding=1), nn.PixelShuffle(4))
+
+    def forward(self, features: Tensor) -> Tensor:
+        return torch.tanh(self.output(self.blocks(features)))
+
+
+BACKBONES: dict[str, tuple[type[nn.Module], type[nn.Module]]] = {
+    "swin": (SwinPatchEncoder, SwinPatchDecoder),
+    "unet": (UNetPatchEncoder, UNetPatchDecoder),
+    "mamba": (MambaPatchEncoder, MambaPatchDecoder),
+}
+
+
 class SparseGraphAggregation(nn.Module):
     """Top-K relation-aware modulation shared by SCA and R-TAP.
 
@@ -174,14 +337,20 @@ class DunhuangTACO(nn.Module):
         depth: int = 4,
         heads: int = 4,
         topk_ratio: float = 0.5,
+        backbone: str = "swin",
     ):
         super().__init__()
         if patch_size != 256:
             raise ValueError("The manuscript configuration uses patch_size=256")
         self.patch_size = patch_size
         self.patch_batch_size = patch_batch_size
-        self.encoder = SwinPatchEncoder(dim, depth, heads)
-        self.decoder = SwinPatchDecoder(dim, depth, heads)
+        backbone = backbone.lower()
+        if backbone not in BACKBONES:
+            raise ValueError(f"backbone must be one of {sorted(BACKBONES)}, got {backbone!r}")
+        encoder_type, decoder_type = BACKBONES[backbone]
+        self.backbone = backbone
+        self.encoder = encoder_type(dim, depth, heads)
+        self.decoder = decoder_type(dim, depth, heads)
         self.graph = SparseGraphAggregation(dim, topk_ratio)
         self.fusion = MaskGuidedFusion()
 
@@ -199,17 +368,48 @@ class DunhuangTACO(nn.Module):
         _, c, ph, pw = patches.shape
         return patches.view(b, gh, gw, c, ph, pw).permute(0, 3, 1, 4, 2, 5).reshape(b, c, gh * ph, gw * pw)
 
-    def _chunked(self, module: nn.Module, values: Tensor) -> Tensor:
-        return torch.cat(
-            [module(values[i : i + self.patch_batch_size]) for i in range(0, len(values), self.patch_batch_size)],
-            dim=0,
+    def _chunked_encode(
+        self, values: Tensor
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+        maps = []
+        skip1 = []
+        skip2 = []
+        for start in range(0, len(values), self.patch_batch_size):
+            encoded = self.encoder(values[start : start + self.patch_batch_size])
+            if isinstance(encoded, tuple):
+                feature_map, skips = encoded
+                maps.append(feature_map)
+                skip1.append(skips[0])
+                skip2.append(skips[1])
+            else:
+                maps.append(encoded)
+        return torch.cat(maps, dim=0), (
+            (torch.cat(skip1, dim=0), torch.cat(skip2, dim=0)) if skip1 else None
         )
 
-    def _encode_tokens(self, image: Tensor) -> tuple[Tensor, Tensor, int, int]:
+    def _chunked_decode(
+        self, values: Tensor, skips: tuple[Tensor, Tensor] | None = None
+    ) -> Tensor:
+        outputs = []
+        for start in range(0, len(values), self.patch_batch_size):
+            chunk = values[start : start + self.patch_batch_size]
+            if skips is None:
+                outputs.append(self.decoder(chunk))
+            else:
+                skip_chunk = (
+                    skips[0][start : start + self.patch_batch_size],
+                    skips[1][start : start + self.patch_batch_size],
+                )
+                outputs.append(self.decoder(chunk, skip_chunk))
+        return torch.cat(outputs, dim=0)
+
+    def _encode_tokens(
+        self, image: Tensor
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None, Tensor, int, int]:
         patches, gh, gw = self._split(image)
-        maps = self._chunked(self.encoder, patches)
+        maps, skips = self._chunked_encode(patches)
         tokens = maps.mean(dim=(-2, -1)).view(image.shape[0], gh * gw, -1)
-        return maps, tokens, gh, gw
+        return maps, skips, tokens, gh, gw
 
     def forward(self, degraded: Tensor, mask: Tensor, reference: Tensor) -> ModelOutput:
         if degraded.ndim != 4 or degraded.shape[1] != 3:
@@ -220,8 +420,8 @@ class DunhuangTACO(nn.Module):
             reference = F.interpolate(reference, degraded.shape[-2:], mode="bilinear", align_corners=False)
 
         masked = degraded * (1.0 - mask)
-        encoded, tokens, gh, gw = self._encode_tokens(masked)
-        _, ref_tokens, _, _ = self._encode_tokens(reference)
+        encoded, skips, tokens, gh, gw = self._encode_tokens(masked)
+        _, _, ref_tokens, _, _ = self._encode_tokens(reference)
 
         mask_patches, _, _ = self._split(mask)
         damage = mask_patches.mean(dim=(-3, -2, -1)).view(degraded.shape[0], gh * gw)
@@ -235,7 +435,7 @@ class DunhuangTACO(nn.Module):
         tokens = torch.where(degraded_nodes.unsqueeze(-1), fused, tokens)
 
         delta = (tokens.reshape(-1, tokens.shape[-1]) - encoded.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
-        decoded = self._chunked(self.decoder, encoded + delta)
+        decoded = self._chunked_decode(encoded + delta, skips)
         prediction = self._join(decoded, degraded.shape[0], gh, gw)
         completed = degraded * (1.0 - mask) + prediction * mask
         return ModelOutput(prediction, completed, gate.squeeze(-1), damage)
@@ -260,4 +460,3 @@ class PatchDiscriminator(nn.Module):
 
     def forward(self, image: Tensor) -> Tensor:
         return self.net(image)
-

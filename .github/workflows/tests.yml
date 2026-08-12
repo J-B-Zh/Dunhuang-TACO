@@ -15,4 +15,4 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e . pytest
       - run: pytest -q
-
+      - run: python complexity.py --resolution 1024
