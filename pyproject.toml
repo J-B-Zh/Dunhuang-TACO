@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dunhuang-taco"
+version = "1.0.0"
+description = "Minimal reference implementation of Dunhuang-TACO"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "Pillow>=10.0",
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "transformers>=4.40",
+]
+
+[tool.setuptools.packages.find]
+include = ["dunhuang_taco*"]
+
+
