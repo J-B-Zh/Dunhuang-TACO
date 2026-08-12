@@ -88,4 +88,3 @@ class ThemeDHDataset(Dataset):
             "path": str(path),
             "original_size": original_size,
         }
-

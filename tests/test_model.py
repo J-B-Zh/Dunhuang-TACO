@@ -35,3 +35,42 @@ def test_minimal_forward_and_known_pixels() -> None:
     assert output.gate.shape == (1, 2)
     assert torch.equal(output.completed * (1 - mask), image * (1 - mask))
 
+
+def test_all_backbones_preserve_the_generator_contract() -> None:
+    image = torch.randn(1, 3, 256, 256).clamp(-1, 1)
+    mask = torch.zeros(1, 1, 256, 256)
+    mask[:, :, 64:192, 64:192] = 1
+    reference = torch.randn_like(image).clamp(-1, 1)
+    for backbone in ("swin", "unet", "mamba"):
+        model = DunhuangTACO(
+            backbone=backbone, patch_batch_size=1, dim=16, depth=1, heads=4
+        )
+        output = model(image, mask, reference)
+        assert output.completed.shape == image.shape
+        assert torch.equal(output.completed * (1 - mask), image * (1 - mask))
+
+
+def test_default_swin_matches_xiufu_dan_hierarchy() -> None:
+    model = DunhuangTACO()
+    assert [len(stage) for stage in model.encoder.stages] == [2, 2, 2, 2]
+    assert [stage[0].dim for stage in model.encoder.stages] == [96, 192, 384, 768]
+    assert [stage[0].attn.num_heads for stage in model.encoder.stages] == [3, 6, 12, 24]
+    assert [stage[0].window_size for stage in model.encoder.stages] == [16, 8, 8, 8]
+    assert [len(stage) for stage in model.decoder.stages] == [2, 2, 2, 2]
+    assert [stage[0].dim for stage in model.decoder.stages] == [1536, 768, 384, 192]
+    assert model.feature_dim == 768
+    assert model.graph_dim == 768
+
+
+def test_backbone_ablation_replaces_only_stage_blocks() -> None:
+    models = {name: DunhuangTACO(backbone=name) for name in ("swin", "unet", "mamba")}
+    for model in models.values():
+        assert [len(stage) for stage in model.encoder.stages] == [2, 2, 2, 2]
+        assert [len(stage) for stage in model.decoder.stages] == [2, 2, 2, 2]
+        assert [tuple(layer.shortcut[0].weight.shape) for layer in model.encoder.mergers] == [
+            (192, 96, 1, 1), (384, 192, 1, 1), (768, 384, 1, 1)
+        ]
+        assert [tuple(layer.shortcut.weight.shape) for layer in model.decoder.expanders] == [
+            (1536, 384, 3, 3), (768, 192, 3, 3),
+            (384, 96, 3, 3), (192, 48, 3, 3)
+        ]

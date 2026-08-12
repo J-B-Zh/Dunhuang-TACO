@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--patch-batch-size", type=int, default=16)
+    parser.add_argument("--backbone", choices=("swin", "unet", "mamba"), default=None)
     return parser.parse_args()
 
 
@@ -46,8 +47,11 @@ def main() -> None:
         reference = reference[0].unsqueeze(0)
     reference = reference.to(device)
 
-    model = DunhuangTACO(patch_batch_size=args.patch_batch_size).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    backbone = args.backbone or checkpoint.get("backbone", "swin")
+    model = DunhuangTACO(
+        patch_batch_size=args.patch_batch_size, backbone=backbone
+    ).to(device)
     model.load_state_dict(checkpoint["generator"])
     model.eval()
     with torch.inference_mode():
@@ -64,4 +68,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

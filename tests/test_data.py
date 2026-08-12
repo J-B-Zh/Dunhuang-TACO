@@ -11,4 +11,3 @@ def test_padding_and_mask_convention() -> None:
     assert padded.shape == (3, 512, 512)
     assert mask.shape == (1, 300, 500)
     assert 0 < mask.mean() <= 1
-

@@ -64,4 +64,3 @@ def generator_objective(
         "adversarial": adversarial,
         "perceptual": perceptual_loss,
     }
-

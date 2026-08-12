@@ -18,4 +18,3 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     build_index(args.images, args.output, args.model, args.batch_size, args.device)
-

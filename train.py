@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--patch-batch-size", type=int, default=16)
+    parser.add_argument("--backbone", choices=("swin", "unet", "mamba"), default="swin")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -51,6 +52,7 @@ def save_checkpoint(
     torch.save(
         {
             "epoch": epoch,
+            "backbone": generator.backbone,
             "generator": generator.state_dict(),
             "discriminator": discriminator.state_dict(),
             "optimizer_g": optimizer_g.state_dict(),
@@ -83,7 +85,9 @@ def main() -> None:
     )
     retriever = DinoV2Retriever(args.index, args.references, args.device)
 
-    generator = DunhuangTACO(patch_batch_size=args.patch_batch_size).to(device)
+    generator = DunhuangTACO(
+        patch_batch_size=args.patch_batch_size, backbone=args.backbone
+    ).to(device)
     discriminator = PatchDiscriminator().to(device)
     perceptual = ResNet50PerceptualLoss().to(device)
     optimizer_g = torch.optim.AdamW(generator.parameters(), lr=args.lr, betas=(0.9, 0.999))
@@ -154,4 +158,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

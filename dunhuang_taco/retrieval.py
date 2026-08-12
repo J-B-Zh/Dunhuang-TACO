@@ -128,4 +128,3 @@ class DinoV2Retriever:
             references.append(load_rgb(self.images_root / relative))
             selected_paths.append(relative)
         return torch.stack(references) if len({x.shape for x in references}) == 1 else references, selected_paths
-
