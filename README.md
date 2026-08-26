@@ -3,6 +3,13 @@
 Official PyTorch implementation of **Dunhuang-TACO: Theme-Aware Coherent
 Inpainting for Dunhuang Murals**.
 
+## Dataset
+
+The cave-organized **ThemeDH** dataset used for training and evaluation is
+publicly available on [Hugging Face](https://huggingface.co/datasets/jibao123/ThemeDH).
+The repository retains the predefined training and test splits organized by
+cave, enabling reproduction of the experimental protocol reported in the paper.
+
 ## Network Architecture
 
 ![Dunhuang-TACO network architecture](assets/network_architecture.png)
